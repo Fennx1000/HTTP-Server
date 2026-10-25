@@ -9,6 +9,9 @@
 const char* CRLF = "\r\n";
 const char* SP = " ";
 
+/* data types and functions */
+/* TODO: tidy these up*/
+
 typedef struct {
 	const char* data;
 	size_t len;
