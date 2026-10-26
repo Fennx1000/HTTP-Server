@@ -4,17 +4,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <linux/limits.h>
+#include <sys/stat.h>
 #include <string.h>
+#include <fcntl.h>
 #include "string_ops.h"
+#include "fs.h"
 
 #define CRLF "\r\n"
 #define SP " "
 
-/*request line - method sp request-uri sp http-version crlf */
+/* request line - method sp request-uri sp http-version crlf */
 typedef struct {
-	string method;
-	string uri;
-	string version;
+	string_view method;
+	string_view uri;
+	string_view version;
 } http_req_line;
 
 typedef enum {
@@ -62,21 +66,21 @@ http_status parse_req_line(http_req_line* req_line, const char* buf, size_t len)
 		return HTTP_RES_BAD_REQUEST;
 	}
 
-	req_line->method.data = components.splits[0].start;
+	req_line->method.start = components.splits[0].start;
 	req_line->method.len = components.splits[0].len;
 
-	req_line->uri.data = components.splits[1].start;
+	req_line->uri.start = components.splits[1].start;
 	req_line->uri.len = components.splits[1].len;
 
-	req_line->version.data = components.splits[2].start;
+	req_line->version.start = components.splits[2].start;
 	req_line->version.len = components.splits[2].len;
 
 	free_splits(&components);
 	return HTTP_RES_OK;
 }
 
-string http_response_generate(char* buf, size_t buf_len, http_status status, size_t body_len) {
-	string response;
+string_view http_response_generate(char* buf, size_t buf_len, http_status status, size_t body_len) {
+	string_view response;
 	int n;
 
 	n = snprintf(buf, buf_len,
@@ -92,7 +96,7 @@ string http_response_generate(char* buf, size_t buf_len, http_status status, siz
 		n = (int)buf_len - 1; /* truncated */
 	}
 
-	response.data = buf;
+	response.start = buf;
 	response.len = (size_t)n;
 	return response;
 }
@@ -115,11 +119,11 @@ static bool send_all(int socket, const char* data, size_t len, int flags) {
 	return true;
 }
 
-bool http_send_response(int socket, string header, string body) {
-	if (!send_all(socket, header.data, header.len, MSG_MORE)) {
+bool http_send_response(int socket, string_view header, string_view body) {
+	if (!send_all(socket, header.start, header.len, MSG_MORE)) {
 		return false;
 	}
-	return send_all(socket, body.data, body.len, 0);
+	return send_all(socket, body.start, body.len, 0);
 }
 
 int handle_client(int client_socket) {
@@ -127,9 +131,9 @@ int handle_client(int client_socket) {
 	int ret = 0;
 	char buf[1024];
 	char header_buf[256]; /* separate from buf so we don't clobber the request */
-	string hello_body = string_from_cstr("<h1>Hello World!</h1>");
-	string bye_body = string_from_cstr("<h1>Bye!</h1>");
-	string err_404 = string_from_cstr("<p>Error 404: Not Found</p><p><a href=\"/\">back to home</a></p>");
+	string_view hello_body = string_from_cstr("<h1>Hello World!</h1>");
+	string_view bye_body = string_from_cstr("<h1>Bye!</h1>");
+	string_view err_404 = string_from_cstr("<p>Error 404: Not Found</p><p><a href=\"/\">back to home</a></p>");
 
 	printf("\n---\n");
 
@@ -137,8 +141,8 @@ int handle_client(int client_socket) {
 		string_splits lines;
 		http_req_line req_line;
 		http_status result;
-		string route_hello;
-		string route_bye;
+		string_view route_hello;
+		string_view route_bye;
 
 		memset(buf, 0, sizeof(buf));
 
@@ -193,7 +197,7 @@ int handle_client(int client_socket) {
 				ret = -1;
 			}
 		} else {
-			printf("ERROR: unknown route \"%.*s\"\n", (int)req_line.uri.len, req_line.uri.data);
+			printf("ERROR: unknown route \"%.*s\"\n", (int)req_line.uri.len, req_line.uri.start);
 			(void)http_send_response(
 					client_socket,
 					http_response_generate(header_buf, sizeof(header_buf), HTTP_RES_NOT_FOUND, err_404.len),
@@ -220,6 +224,17 @@ int main(void) {
 	int client_socket = 0;
 	int enabled = true;
 
+	const char* web_root = "./www";
+
+	string_view web_root_view;
+	web_root_view.start = web_root;
+	web_root_view.len = strlen(web_root);
+
+	fs_metadata web_root_meta = fs_get_metadata(web_root_view);
+	if (!web_root_meta.exists) {
+		mkdir(web_root,
+				S_IEXEC | S_IWRITE | S_IREAD | S_IRGRP | S_IXGRP | S_IXOTH | S_IROTH);
+	}
 	/* initialise */
 
 	memset(&bind_addr, 0, sizeof(bind_addr));

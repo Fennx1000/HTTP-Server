@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef STRING_OPS_H
 #define STRING_OPS_H
 
@@ -8,7 +10,6 @@
 #include <string.h>
 #include <errno.h>
 
-/* TODO: This is the same as string_view */
 typedef struct {
 	const char* start;
 	size_t len;
@@ -20,31 +21,26 @@ typedef struct {
 	size_t capacity;
 } string_splits;
 
-typedef struct {
-	const char* data;
-	size_t len;
-} string;
-
-static inline bool string_equal(const string* l, const string* r) {
-	return l->len == r->len && memcmp(l->data, r->data, l->len) == 0;
+static inline bool string_equal(const string_view* l, const string_view* r) {
+	return l->len == r->len && memcmp(l->start, r->start, l->len) == 0;
 }
 
-static inline string string_from_cstr(const char* str) {
-	string s;
+static inline string_view string_from_cstr(const char* str) {
+	string_view s;
 	s.len = strlen(str);
-	s.data = str;
+	s.start = str;
 	return s;
 }
 
-static inline void string_trim_spaces(string* s) {
+static inline void string_trim_spaces(string_view* s) {
 	/* left trim */
-	while (s->len > 0 && *s->data == ' ') {
-		s->data += 1;
+	while (s->len > 0 && *s->start == ' ') {
+		s->start+= 1;
 		s->len -= 1;
 	}
 
 	/* right trim */
-	while (s->len > 0 && s->data[s->len-1] == ' ') {
+	while (s->len > 0 && s->start[s->len-1] == ' ') {
 		s->len -= 1;
 	}
 }
