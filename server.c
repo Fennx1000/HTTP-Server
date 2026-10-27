@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdint.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <stdio.h>
@@ -10,7 +11,9 @@
 #include <sys/types.h>
 #include <string.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/sendfile.h>
+#include <pthread.h>
 #include "string_ops.h"
 #include "fs.h"
 
@@ -100,6 +103,7 @@ string_view http_response_generate(char* buf, size_t buf_len, http_status status
 			"HTTP/1.0 %d %s" CRLF
 			"Content-Type: text/html" CRLF
 			"Content-Length: %zu" CRLF
+			"Connection: keep-alive" CRLF
 			CRLF,
 			(int)status, http_status_to_string(status), body_len);
 
@@ -120,6 +124,9 @@ static bool send_all(int socket, const char* data, size_t len, int flags) {
 	while (sent < len) {
 		ssize_t n = send(socket, data + sent, len - sent, flags);
 		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
 			perror("send()");
 			return false;
 		}
@@ -142,6 +149,33 @@ bool http_send_response(int socket, string_view header, string_view body) {
 	return send_all(socket, body.start, body.len, 0);
 }
 
+static void http_send_not_found(int socket) {
+	char buf[256];
+
+	(void)http_send_response(
+			socket,
+			http_response_generate(buf, sizeof(buf), HTTP_RES_NOT_FOUND, err_404.len),
+			err_404);
+}
+
+/*
+ * Reject URIs that could escape WEB_ROOT: anything containing ".."
+ * or an embedded NUL byte.
+ */
+static bool uri_is_safe(string_view uri) {
+	size_t i;
+
+	for (i = 0; i < uri.len; ++i) {
+		if (uri.start[i] == '\0') {
+			return false;
+		}
+		if (uri.start[i] == '.' && i + 1 < uri.len && uri.start[i + 1] == '.') {
+			return false;
+		}
+	}
+	return true;
+}
+
 /*
  * Serve a file located under WEB_ROOT.
  * `filename` is relative to WEB_ROOT, e.g. "index.html".
@@ -155,15 +189,16 @@ bool http_serve_file(int socket, string_view filename) {
 	int in_fd = -1;
 	bool return_value = true;
 	string_view header;
-	string_view full_path;
 	fs_metadata file_metadata;
+
+	if (!uri_is_safe(filename)) {
+		http_send_not_found(socket);
+		return false;
+	}
 
 	/* build "<WEB_ROOT><filename>", rejecting anything that won't fit */
 	if (WEB_ROOT.len + filename.len >= sizeof(filename_buf)) {
-		(void)http_send_response(
-				socket,
-				http_response_generate(buf, sizeof(buf), HTTP_RES_NOT_FOUND, err_404.len),
-				err_404);
+		http_send_not_found(socket);
 		return false;
 	}
 
@@ -171,26 +206,17 @@ bool http_serve_file(int socket, string_view filename) {
 	memcpy(filename_buf, WEB_ROOT.start, WEB_ROOT.len);
 	memcpy(filename_buf + WEB_ROOT.len, filename.start, filename.len);
 
-	full_path.start = filename_buf;
-	full_path.len = WEB_ROOT.len + filename.len;
-
 	/* check the full path, not just the bare filename */
 	file_metadata = fs_get_metadata(string_from_cstr(filename_buf));
 	if (!file_metadata.exists) {
-		(void)http_send_response(
-				socket,
-				http_response_generate(buf, sizeof(buf), HTTP_RES_NOT_FOUND, err_404.len),
-				err_404);
+		http_send_not_found(socket);
 		return false;
 	}
 
 	/* open BEFORE sending headers so we can still send a proper 404 */
 	in_fd = open(filename_buf, O_RDONLY);
 	if (in_fd < 0) {
-		(void)http_send_response(
-				socket,
-				http_response_generate(buf, sizeof(buf), HTTP_RES_NOT_FOUND, err_404.len),
-				err_404);
+		http_send_not_found(socket);
 		return false;
 	}
 
@@ -206,6 +232,9 @@ bool http_serve_file(int socket, string_view filename) {
 	while (sent < total) {
 		ssize_t result = sendfile(socket, in_fd, &sendfile_offset, total - sent);
 		if (result < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
 			printf("ERROR: sendfile() failed for \"%s\": %s\n",
 					filename_buf, strerror(errno));
 			/* headers already sent, can't send an error page now */
@@ -227,11 +256,11 @@ cleanup:
 	return return_value;
 }
 
-int handle_client(int client_socket) {
+void* handle_client(void* client_socket_ptr) {
+	int client_socket = (int)(intptr_t)client_socket_ptr;
 	ssize_t n = 0;
 	int ret = 0;
 	char buf[1024];
-	char header_buf[256]; /* separate from buf so we don't clobber the request */
 
 	printf("\n---\n");
 
@@ -246,8 +275,8 @@ int handle_client(int client_socket) {
 		n = read(client_socket, buf, sizeof(buf)-1);
 		if (n < 0) {
 			perror("read(client)");
-			close(client_socket);
-			return -1;
+			ret = -1;
+			break;
 		}
 
 		if (n == 0) {
@@ -255,26 +284,26 @@ int handle_client(int client_socket) {
 			break;
 		}
 
-		printf("REQUEST:\n%s", buf);
-
 		lines = split_string(buf, (size_t)n, CRLF);
 
 		if (lines.count < 1) {
 			printf("ERROR: empty request\n");
 			free_splits(&lines);
-			close(client_socket);
-			return -1;
+			ret = -1;
+			break;
 		}
 
 		req_line = http_req_line_init();
 		result = parse_req_line(&req_line, lines.splits[0].start, lines.splits[0].len);
 		free_splits(&lines);
 		if (result != HTTP_RES_OK) {
-			/* TODO: Return correct error + error page */
 			printf("ERROR: failed to parse line\n");
-			close(client_socket);
-			return -1;
+			ret = -1;
+			break;
 		}
+
+		printf("REQUEST: %.*s %.*s\n", (int)req_line.method.len, req_line.method.start,
+					       (int)req_line.uri.len, req_line.uri.start);
 
 		route_root = string_from_cstr("/");
 
@@ -282,22 +311,22 @@ int handle_client(int client_socket) {
 			/* path is relative to WEB_ROOT, which http_serve_file prepends */
 			if (!http_serve_file(client_socket, string_from_cstr("index.html"))) {
 				ret = -1;
+				break;
 			}
 		} else {
-			printf("ERROR: unknown route \"%.*s\"\n", (int)req_line.uri.len, req_line.uri.start);
-			(void)http_send_response(
-					client_socket,
-					http_response_generate(header_buf, sizeof(header_buf), HTTP_RES_NOT_FOUND, err_404.len),
-					err_404);
-			ret = -1;
+			if (!http_serve_file(client_socket, req_line.uri)) {
+				ret = -1;
+				break;
+			}
 		}
 
 		break;
 	}
-	close(client_socket);
-	printf("\n---\n");
 
-	return ret;
+	printf("Closing Connection%d\n", ret);
+	close(client_socket);
+
+	pthread_exit((void*)(intptr_t)ret);
 }
 
 const int PORT = 6969;
@@ -309,13 +338,17 @@ int main(void) {
 	int tcp_socket = 0;
 	int ret = 0;
 	int client_socket = 0;
-	int enabled = true;
+	int enabled = 1;
+	fs_metadata web_root_meta;
 
-	fs_metadata web_root_meta = fs_get_metadata(WEB_ROOT);
+	/* a client hanging up mid-send shouldn't kill the whole server */
+	signal(SIGPIPE, SIG_IGN);
+
+	web_root_meta = fs_get_metadata(WEB_ROOT);
 	if (!web_root_meta.exists) {
 		/* rwxr-xr-x */
 		/* this is safe because it is from a literal which is 0-terminated */
-		mkdir(WEB_ROOT.start, S_IEXEC | S_IWRITE | S_IREAD | S_IXGRP | S_IXOTH | S_IROTH);
+		mkdir(WEB_ROOT.start, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 	}
 
 	/* initialise */
@@ -360,6 +393,8 @@ int main(void) {
 	printf("listening on http://localhost:%d/\n", PORT);
 
 	for (;;) {
+		pthread_t thread;
+
 		printf("waiting for connections...\n");
 		client_socket = accept(tcp_socket, NULL, NULL);
 		if (client_socket < 0) {
@@ -368,8 +403,16 @@ int main(void) {
 		}
 
 		printf("got a connection\n");
-		rc = handle_client(client_socket);
-		(void)rc; /* ignore errors, dont care for now */
+		rc = pthread_create(&thread, NULL, handle_client, (void*)(intptr_t)client_socket);
+		if (rc != 0) {
+			/* pthread_create returns the error code, it doesn't set errno */
+			fprintf(stderr, "pthread_create(): %s\n", strerror(rc));
+			close(client_socket);
+			continue;
+		}
+
+		/* nobody joins these, so let the system reclaim them when they finish */
+		pthread_detach(thread);
 	}
 
 exit:
