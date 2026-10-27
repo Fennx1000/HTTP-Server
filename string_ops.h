@@ -32,6 +32,9 @@ static inline string_view string_from_cstr(const char* str) {
 	return s;
 }
 
+#define STRING_VIEW_FROM_LITERAL(str) \
+	(string_view) { .start = str, .len = sizeof(str) }
+
 static inline void string_trim_spaces(string_view* s) {
 	/* left trim */
 	while (s->len > 0 && *s->start == ' ') {
