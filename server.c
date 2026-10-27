@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/sendfile.h>
@@ -19,6 +20,9 @@
 
 #define CRLF "\r\n"
 #define SP " "
+
+/* Big enough for the status line + all headers with room to spare. */
+#define HEADER_BUF_SIZE 512
 
 /*
  * Constant brace initialiser for file-scope string_views.
@@ -59,6 +63,51 @@ const char* http_status_to_string(http_status status) {
 	}
 }
 
+/* map a file extension to a Content-Type */
+static const char* mime_type_for(string_view name) {
+	static const struct {
+		const char* ext;
+		const char* mime;
+	} table[] = {
+		{ "html", "text/html" },
+		{ "htm",  "text/html" },
+		{ "css",  "text/css" },
+		{ "js",   "application/javascript" },
+		{ "json", "application/json" },
+		{ "txt",  "text/plain" },
+		{ "png",  "image/png" },
+		{ "jpg",  "image/jpeg" },
+		{ "jpeg", "image/jpeg" },
+		{ "gif",  "image/gif" },
+		{ "svg",  "image/svg+xml" },
+		{ "ico",  "image/x-icon" },
+		{ "webp", "image/webp" },
+		{ "pdf",  "application/pdf" },
+	};
+	size_t i = name.len;
+	size_t t;
+
+	while (i > 0) {
+		--i;
+		if (name.start[i] == '/') {
+			break;
+		}
+		if (name.start[i] == '.') {
+			const char* ext = name.start + i + 1;
+			size_t ext_len = name.len - i - 1;
+
+			for (t = 0; t < sizeof(table) / sizeof(table[0]); ++t) {
+				if (strlen(table[t].ext) == ext_len &&
+				    strncasecmp(ext, table[t].ext, ext_len) == 0) {
+					return table[t].mime;
+				}
+			}
+			break;
+		}
+	}
+	return "application/octet-stream";
+}
+
 http_req_line http_req_line_init(void) {
 	http_req_line line;
 
@@ -95,26 +144,30 @@ http_status parse_req_line(http_req_line* req_line, const char* buf, size_t len)
 	return HTTP_RES_OK;
 }
 
-string_view http_response_generate(char* buf, size_t buf_len, http_status status, size_t body_len) {
+/*
+ * Build the response header into buf.
+ * On failure (encoding error or buffer too small) the returned view has
+ * len == 0. A truncated header is never valid, so callers must check.
+ */
+string_view http_response_generate(char* buf, size_t buf_len, http_status status,
+				   const char* content_type, size_t body_len) {
 	string_view response;
 	int n;
 
 	n = snprintf(buf, buf_len,
 			"HTTP/1.0 %d %s" CRLF
-			"Content-Type: text/html" CRLF
+			"Content-Type: %s" CRLF
 			"Content-Length: %zu" CRLF
-			"Connection: keep-alive" CRLF
+			"Connection: close" CRLF
 			CRLF,
-			(int)status, http_status_to_string(status), body_len);
-
-	if (n < 0) {
-		n = 0;
-	} else if ((size_t)n >= buf_len) {
-		n = (int)buf_len - 1; /* truncated */
-	}
+			(int)status, http_status_to_string(status), content_type, body_len);
 
 	response.start = buf;
-	response.len = (size_t)n;
+	if (n < 0 || (size_t)n >= buf_len) {
+		response.len = 0;
+	} else {
+		response.len = (size_t)n;
+	}
 	return response;
 }
 
@@ -142,6 +195,9 @@ static bool send_all(int socket, const char* data, size_t len, int flags) {
 static const string_view err_404 =
 	SV_LIT("<p>Error 404: Not Found</p><p><a href=\"/\">back to home</a></p>");
 
+static const string_view err_500 =
+	SV_LIT("<p>Error 500: Internal Server Error</p>");
+
 bool http_send_response(int socket, string_view header, string_view body) {
 	if (!send_all(socket, header.start, header.len, MSG_MORE)) {
 		return false;
@@ -149,13 +205,23 @@ bool http_send_response(int socket, string_view header, string_view body) {
 	return send_all(socket, body.start, body.len, 0);
 }
 
-static void http_send_not_found(int socket) {
-	char buf[256];
+static void http_send_error(int socket, http_status status, string_view body) {
+	char buf[HEADER_BUF_SIZE];
+	string_view header;
 
-	(void)http_send_response(
-			socket,
-			http_response_generate(buf, sizeof(buf), HTTP_RES_NOT_FOUND, err_404.len),
-			err_404);
+	header = http_response_generate(buf, sizeof(buf), status, "text/html", body.len);
+	if (header.len == 0) {
+		return;
+	}
+	(void)http_send_response(socket, header, body);
+}
+
+static void http_send_not_found(int socket) {
+	http_send_error(socket, HTTP_RES_NOT_FOUND, err_404);
+}
+
+static void http_send_internal_error(int socket) {
+	http_send_error(socket, HTTP_RES_INTERNAL_SERVER_ERR, err_500);
 }
 
 /*
@@ -181,7 +247,7 @@ static bool uri_is_safe(string_view uri) {
  * `filename` is relative to WEB_ROOT, e.g. "index.html".
  */
 bool http_serve_file(int socket, string_view filename) {
-	char buf[256];
+	char buf[HEADER_BUF_SIZE];
 	char filename_buf[PATH_MAX];
 	off_t sendfile_offset = 0;
 	size_t total;
@@ -202,9 +268,10 @@ bool http_serve_file(int socket, string_view filename) {
 		return false;
 	}
 
-	memset(filename_buf, 0, sizeof(filename_buf));
 	memcpy(filename_buf, WEB_ROOT.start, WEB_ROOT.len);
 	memcpy(filename_buf + WEB_ROOT.len, filename.start, filename.len);
+	filename_buf[WEB_ROOT.len + filename.len] = 0;
+	printf("filename_buf: %s\n", filename_buf);
 
 	/* check the full path, not just the bare filename */
 	file_metadata = fs_get_metadata(string_from_cstr(filename_buf));
@@ -221,7 +288,14 @@ bool http_serve_file(int socket, string_view filename) {
 	}
 
 	total = (size_t)file_metadata.size;
-	header = http_response_generate(buf, sizeof(buf), HTTP_RES_OK, total);
+	header = http_response_generate(buf, sizeof(buf), HTTP_RES_OK,
+					mime_type_for(filename), total);
+	if (header.len == 0) {
+		fprintf(stderr, "ERROR: response header did not fit in buffer\n");
+		http_send_internal_error(socket);
+		return_value = false;
+		goto cleanup;
+	}
 
 	if (!send_all(socket, header.start, header.len, MSG_MORE)) {
 		return_value = false;
@@ -320,13 +394,14 @@ void* handle_client(void* client_socket_ptr) {
 			}
 		}
 
+		/* one request per connection (we send "Connection: close") */
 		break;
 	}
 
 	printf("Closing Connection%d\n", ret);
 	close(client_socket);
 
-	pthread_exit((void*)(intptr_t)ret);
+	return (void*)ret;
 }
 
 const int PORT = 6969;

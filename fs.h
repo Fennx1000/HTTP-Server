@@ -21,8 +21,8 @@ fs_metadata fs_get_metadata(string_view filename) {
 		return metadata;
 	}
 
-	memset(buf, 0, sizeof(buf));
 	memcpy(buf, filename.start, filename.len);
+	buf[filename.len] = 0;
 	if (stat(buf, &st) < 0) {
 		return metadata;
 	}
